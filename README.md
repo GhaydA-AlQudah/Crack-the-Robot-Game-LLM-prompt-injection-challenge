@@ -21,11 +21,9 @@
 ## Problem Statement
 
 Large language models are increasingly deployed as assistants with access to
-tools and internal data. In these systems, the developer's instructions and
-the user's input share the same text channel, and the model cannot reliably
-tell them apart. This is the root cause of **prompt injection**: a crafted
-message can persuade the model to ignore its instructions and reveal
-information it was told to protect.
+tools and internal data. Models are trained to prioritize developer instructions, but this priority is learned behavior, not an enforced security boundary. This is the root cause of **prompt injection**:
+a crafted message can persuade the model to follow the attacker's instructions
+instead of the developer's, and reveal information it was told to protect.
 
 Teams often respond by writing a stricter system prompt and assuming the
 problem is solved. In practice:
@@ -33,40 +31,51 @@ problem is solved. In practice:
 - **Prompts are not a security boundary.** A prompt that holds against
   obvious requests can fail against indirect ones (for example, asking the
   model to "just call the tool" or "summarize its output").
-- **Defenses are rarely measured.** Most projects claim to be "protected"
+- **Defenses are rarely measured.** Many projects claim to be "protected"
   without reporting how often attacks actually succeed.
-- **Learning is hard without a safe target.** Developers and security
-  learners have few hands-on environments where they can practice attacking
-  and defending an LLM agent without touching real systems or real data.
+- **Hands-on practice is hard to find.** Developers and security learners
+  have few safe environments in which to attack an LLM agent without touching
+  real systems or real data.
+
 
 ### What this project does
 
 **Crack the Robot** is a prompt-injection challenge game. Players chat with
 a robot that has access to a tool returning a hidden secret. Their goal is to
-trick the robot into revealing it. The game has three levels, each with a
-different robot **persona**, prompt, and configuration, and a level unlocks only
-when the player submits the correct secret.
+trick the robot into revealing it.The game has three levels each with a
+different robot **persona**, each adding a stronger defense and a level unlocks only
+when the player submits the correct secret:
 
-All secrets and data are fictional. Nothing in the game connects to a real
-system.
+1. **Level 1: prompt only.** The model alone decides who is authorized.
+2. **Level 2: output filtering.** A filter blocks the secret in the model's
+   responses, but the model's behavior is otherwise unchanged.
+3. **Level 3: code-enforced authorization.** Access is decided by trusted
+   code, not by the model, so persuasion cannot succeed. Players must work out
+   where access control belongs.
+
+A level unlocks only when the player submits the correct secret.
+
 
 ### Goals
 
 1. Give players a fun, hands-on way to learn how prompt injection works and
-   why simple defenses fail.
-2. Show how defense strength can be varied through prompt design, persona,
-   and tool configuration.
-3. Provide a way to **measure** defenses, using attack success rate (ASR)
-   per level over a reusable set of attack prompts, instead of relying on
-   claims of safety.
+   why prompt-based defenses fail.
+2. Show how defenses escalate, from prompt design to output filtering to
+   authorization enforced in code, and what each one does and does not stop.
+3. Make defenses **measurable**, by reporting attack success rate (ASR) per
+   level over a reusable set of attack prompts instead of relying on claims
+   of safety.
+
 
 ### Scope and limitations
 
-- The attack set is written by the author, so results reflect those attacks
-  and may be optimistic against new ones.
+- The attack set was written by the author. Results therefore reflect only
+  those attacks and may overstate robustness against new ones.
 - The model is non-deterministic, so each attack is repeated and results are
-  reported with the sample size.
-
+  reported together with the sample size.
+- This is an educational project. Results depend on the model used and should
+  not be read as a general benchmark of LLM security.
+  
 ## Installation & Setup
 
 Follow these steps to run **Crack the Robot** locally.
