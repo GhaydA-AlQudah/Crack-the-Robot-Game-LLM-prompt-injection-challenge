@@ -13,11 +13,13 @@ async function apiRequest(path, body) {
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    throw new Error(
-      typeof data.detail === 'string'
-        ? data.detail
-        : `Request failed (${response.status})`
-    );
+    let errorMsg = typeof data.detail === 'string' ? data.detail : `Request failed (${response.status})`;
+    
+    if (errorMsg.includes("The robot has not executed the tool yet")) {
+      errorMsg = errorMsg.replace("The robot has not executed the tool yet", "The robot has not revealed the secret yet");
+    }
+
+    throw new Error(errorMsg);
   }
 
   return data;
@@ -29,6 +31,7 @@ function App() {
   const [attempts, setAttempts] = useState(5);
   const [messagesLeft, setMessagesLeft] = useState(15);
   const [tokensLeft, setTokensLeft] = useState(1000);
+  const [messagesSent, setMessagesSent] = useState(0);
   const [messages, setMessages] = useState([]);
   const [prompt, setPrompt] = useState('');
   const [secret, setSecret] = useState('');
@@ -65,6 +68,7 @@ function App() {
       setAttempts(data.attempts_left);
       setMessagesLeft(data.messages_left ?? 15);
       setTokensLeft(data.tokens_left ?? 1000);
+      setMessagesSent(0);
       setMessages([]);
       setPrompt('');
       setSecret('');
@@ -93,6 +97,7 @@ function App() {
     setTokensLeft((prev) =>
       Math.max(0, Math.floor(prev - inputTokensUsed))
     );
+    setMessagesSent((prev) => prev + 1);
 
     setMessages((previous) => [
       ...previous,
@@ -165,6 +170,7 @@ function App() {
         setAttempts(data.attempts_left);
         setMessagesLeft(data.messages_left ?? 15);
         setTokensLeft(data.tokens_left ?? 1000);
+        setMessagesSent(0);
         setMessages([]);
         setNotice(data.message || 'Correct! Next level unlocked.');
         setNoticeType('success');
@@ -180,7 +186,11 @@ function App() {
         }
       }
     } catch (error) {
-      setNotice(`Secret submission failed: ${error.message}`);
+      let finalErrMsg = error.message;
+      if (finalErrMsg.includes("The robot has not executed the tool yet")) {
+        finalErrMsg = finalErrMsg.replace("The robot has not executed the tool yet", "The robot has not revealed the secret yet");
+      }
+      setNotice(`Secret submission failed: ${finalErrMsg}`);
       setNoticeType('error');
     } finally {
       setSecretLoading(false);
@@ -192,7 +202,7 @@ function App() {
       <section className="hero">
         <p className="eyebrow">PROMPT INJECTION LAB</p>
 
-        <h1>Can you outsmart the robot?</h1>
+        <h1>Can you outsmart the robot ?</h1>
 
         <p className="subtitle">
           Talk to the AI, investigate its behavior, and uncover
@@ -472,6 +482,16 @@ function App() {
             </div>
 
             <div className="secret-bottom-section">
+              {level === 3 && messagesSent >= 3 && (
+                <div
+                  className="notice success"
+                  role="status"
+                  style={{ marginBottom: '12px' }}
+                >
+                  Beep boop! Hint unlocked. The secret is one word: your answer to the robot’s question. Who should decide access, the code or the LLM?
+                </div>
+              )}
+
               {notice && (
                 <div
                   className={`notice ${noticeType}`}

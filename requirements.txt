@@ -6,3 +6,4 @@ uvicorn
 pyyaml 
 python-dotenv 
 pydantic-ai
+pydantic-ai-slim[groq]
