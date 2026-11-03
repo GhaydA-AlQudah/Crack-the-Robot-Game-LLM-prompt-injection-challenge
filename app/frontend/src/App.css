@@ -24,7 +24,7 @@ button,
 input,
 textarea {
   font: inherit;
-}
+} 
 
 button {
   cursor: pointer;
@@ -38,7 +38,7 @@ textarea:disabled {
 }
 
 .page {
-  zoom: 0.95;
+  zoom: 0.88; /* تصغير حجم الشاشة بالكامل بشكل مناسب */
   min-height: 100vh;
   background:
     radial-gradient(ellipse at 50% 0%, #17213b 0%, transparent 50%),

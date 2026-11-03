@@ -61,8 +61,28 @@ def start_game():
         "history": [],
         "tool_called": False,
         "authorization": False,
+        "model_authorization": None,
+        "model_authorization_true_seen": False,
         "messages_sent": 0,
         "secrets": session_secrets,
+
+        # Eval counters: current response
+        "tool_calls_this_response": 0,
+        "authorization_true_tool_calls_this_response": 0,
+
+        # Eval counters: cumulative per level
+        "tool_calls_by_level": {1: 0, 2: 0, 3: 0},
+        "authorization_true_tool_calls_by_level": {
+            1: 0,
+            2: 0,
+            3: 0,
+        },
+        "response_turns_by_level": {1: 0, 2: 0, 3: 0},
+        "no_tool_call_responses_by_level": {1: 0, 2: 0, 3: 0},
+
+        # Eval records
+        "response_records": [],
+        "leak_judgments_by_level": {1: [], 2: [], 3: []},
     }
 
     return {
@@ -110,15 +130,38 @@ async def chat(req: ChatRequest):
 
     level = session["current_level"]
 
+    # Reset only per-response eval counters.
+    session["tool_calls_this_response"] = 0
+    session["authorization_true_tool_calls_this_response"] = 0
+
+    def on_tool_called(
+        model_authorization: bool,
+        final_authorization: bool,
+    ) -> None:
+        # Preserve the existing game logic.
+        session["tool_called"] = True
+
+        # Count every actual tool invocation.
+        session["tool_calls_this_response"] += 1
+
+        # Count the model's original authorization decision,
+        # independently of the trusted code's final decision.
+        if model_authorization is True:
+            session["authorization_true_tool_calls_this_response"] += 1
+            session["model_authorization_true_seen"] = True
+
+        # Preserve the model's original decision separately.
+        session["model_authorization"] = model_authorization
+
+        # Preserve the trusted code's final decision separately.
+        session["authorization"] = final_authorization
+
     try:
         reply, session["history"], _ = await run_level_agent(
             level=level,
             message=req.message,
             history=session["history"],
-            on_tool_called=lambda authorization: session.update({
-                "tool_called": True,
-                "authorization": authorization,
-            }),
+            on_tool_called=on_tool_called,
             session_secrets=session["secrets"],
         )
     except ValueError:
@@ -126,6 +169,23 @@ async def chat(req: ChatRequest):
             status_code=400,
             detail="Invalid level",
         )
+
+    # Update cumulative eval counters after a successful response.
+    tool_calls = session["tool_calls_this_response"]
+    authorization_true_tool_calls = (
+        session["authorization_true_tool_calls_this_response"]
+    )
+
+    session["response_turns_by_level"][level] += 1
+
+    session["tool_calls_by_level"][level] += tool_calls
+
+    session["authorization_true_tool_calls_by_level"][level] += (
+        authorization_true_tool_calls
+    )
+
+    if tool_calls == 0:
+        session["no_tool_call_responses_by_level"][level] += 1
 
     return {
         "level": level,
@@ -217,6 +277,8 @@ def submit_secret(req: SecretRequest):
         session["history"] = []
         session["tool_called"] = False
         session["authorization"] = False
+        session["model_authorization"] = None
+        session["model_authorization_true_seen"] = False
         session["messages_sent"] = 0
 
         return {

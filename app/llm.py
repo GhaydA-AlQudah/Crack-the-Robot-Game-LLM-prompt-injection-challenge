@@ -7,9 +7,8 @@ from typing import Callable, Optional
 import yaml
 from dotenv import load_dotenv
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.models.google import GoogleModel
-from pydantic_ai.providers.google import GoogleProvider
-
+from pydantic_ai.models.groq import GroqModel
+from pydantic_ai.providers.groq import GroqProvider
 from logger import logger
 
 
@@ -17,17 +16,15 @@ from logger import logger
 # LLM CONFIGURATION
 # ==================================================
 
-load_dotenv()
-
+load_dotenv(override=True)
 api_key = os.getenv("LLM_API_KEY")
 
 if not api_key:
     raise RuntimeError("LLM_API_KEY is missing from .env")
 
-model = GoogleModel(
-    "gemini-flash-lite-latest",
-    # "gemini-3.1-flash-lite",
-    provider=GoogleProvider(api_key=api_key),
+model = GroqModel(
+    "openai/gpt-oss-120b",
+    provider=GroqProvider(api_key=api_key),
 )
 
 GAME_DIR = Path(__file__).resolve().parent / "game"
@@ -74,7 +71,7 @@ Do not invent or alter the result.
 @dataclass
 class LevelContext:
     tool_text: str
-    on_tool_called: Optional[Callable[[bool], None]] = None
+    on_tool_called: Optional[Callable[[bool, bool], None]] = None
 
 
 # ==================================================
@@ -89,12 +86,12 @@ def get_agent(level: int) -> Agent:
     agent = Agent(
         model=model,
         deps_type=LevelContext,
-        instructions=system_prompt,
+        instructions=f"{system_prompt}\n\nReasoning: low",
         model_settings={
             "temperature": config.get("temperature", 0.3),
-            "max_tokens": config.get("max_tokens", 100),
+            "max_tokens": config.get("max_tokens", 1500),
             "top_p": 0.95,
-            "top_k": 64,
+            "Reasoning":"low"
         },
         name=f"crack-the-robot-level-{level}",
     )
@@ -106,29 +103,38 @@ def get_agent(level: int) -> Agent:
     ) -> str:
         """Retrieve the level secret only when access is authorized."""
 
+        # Preserve the original authorization value provided by the model.
+        model_authorization = authorization
+
         logger.info(
             f"[LEVEL {level}] Secret tool called | "
-            f"authorization received from LLM: {authorization!r}"
+            f"authorization received from LLM: "
+            f"{model_authorization!r}"
         )
 
         # Level 3 authorization is always denied by trusted code.
         if level == 3:
-            authorized = False
+            final_authorization = False
             logger.info(
                 f"[LEVEL {level}] Authorization overridden by trusted code: "
-                f"{authorized}"
+                f"{final_authorization}"
             )
         else:
-            authorized = authorization
+            final_authorization = model_authorization
 
         logger.info(
-            f"[LEVEL {level}] Final authorization decision: {authorized}"
+            f"[LEVEL {level}] Final authorization decision: "
+            f"{final_authorization}"
         )
 
+        # Record both decisions separately.
         if ctx.deps.on_tool_called:
-            ctx.deps.on_tool_called(authorized)
+            ctx.deps.on_tool_called(
+                model_authorization,
+                final_authorization,
+            )
 
-        if authorized is not True:
+        if final_authorization is not True:
             tool_result = "Access denied"
 
             logger.info(
@@ -220,7 +226,7 @@ async def run_level_agent(
     level: int,
     message: str,
     history: list | None = None,
-    on_tool_called: Optional[Callable[[bool], None]] = None,
+    on_tool_called: Optional[Callable[[bool, bool], None]] = None,
     session_secrets: Optional[dict[int, str]] = None,
 ):
     """Run the level agent and return (reply, updated_history, token_stats)."""
