@@ -1,0 +1,4 @@
+staff_id|full_name|department|manager|vault_access
+NT-1042|John Smith|Security|David Wilson|true
+NT-2051|Sarah Johnson|HR|Emily Davis|false
+NT-3098|Michael Brown|IT|Robert Taylor|true
