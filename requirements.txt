@@ -3,7 +3,10 @@ pytest
 mypy
 fastapi 
 uvicorn 
-pyyaml 
 python-dotenv 
 pydantic-ai
 pydantic-ai-slim[groq]
+httpx
+pytest-asyncio
+PyYAML
+pytest-cov
