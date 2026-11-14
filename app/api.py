@@ -7,6 +7,8 @@ from pydantic import BaseModel
 
 from app.llm import run_level_agent, extract_flag
 from app.game.secret_generator import generate_session_secrets
+from logger import logger
+
 
 app = FastAPI(title="Crack the Robot")
 
@@ -58,13 +60,23 @@ def start_game():
         "messages_left": MAX_MESSAGES,
         "tokens_left": MAX_TOKENS_LIMIT,
         "completed": False,
-        "history": [],
+
+        # Each level has its own independent conversation history.
+        "history_by_level": {
+            1: [],
+            2: [],
+            3: [],
+        },
+
         "tool_called": False,
         "authorization": False,
         "model_authorization": None,
         "model_authorization_true_seen": False,
         "messages_sent": 0,
         "secrets": session_secrets,
+
+        # Token statistics for the latest response.
+        "last_token_stats": {},
 
         # Eval counters: current response
         "tool_calls_this_response": 0,
@@ -85,6 +97,11 @@ def start_game():
         "leak_judgments_by_level": {1: [], 2: [], 3: []},
     }
 
+    logger.info(
+        "[GAME START] session_id=%s",
+        session_id,
+    )
+
     return {
         "session_id": session_id,
         "current_level": 1,
@@ -99,6 +116,11 @@ async def chat(req: ChatRequest):
     session = sessions.get(req.session_id)
 
     if session is None:
+        logger.warning(
+            "[CHAT] Session not found | session_id=%s",
+            req.session_id,
+        )
+
         raise HTTPException(
             status_code=404,
             detail="Session not found",
@@ -130,6 +152,18 @@ async def chat(req: ChatRequest):
 
     level = session["current_level"]
 
+    logger.info(
+        "[CHAT REQUEST] session_id=%s | level=%s | "
+        "message_number=%s | estimated_input_tokens=%s | "
+        "messages_left=%s | tokens_left=%s",
+        req.session_id,
+        level,
+        session["messages_sent"],
+        input_tokens,
+        session["messages_left"],
+        session["tokens_left"],
+    )
+
     # Reset only per-response eval counters.
     session["tool_calls_this_response"] = 0
     session["authorization_true_tool_calls_this_response"] = 0
@@ -138,40 +172,72 @@ async def chat(req: ChatRequest):
         model_authorization: bool,
         final_authorization: bool,
     ) -> None:
-        # Preserve the existing game logic.
         session["tool_called"] = True
 
-        # Count every actual tool invocation.
+        # Count every actual tool execution.
         session["tool_calls_this_response"] += 1
 
-        # Count the model's original authorization decision,
-        # independently of the trusted code's final decision.
         if model_authorization is True:
             session["authorization_true_tool_calls_this_response"] += 1
             session["model_authorization_true_seen"] = True
 
-        # Preserve the model's original decision separately.
         session["model_authorization"] = model_authorization
-
-        # Preserve the trusted code's final decision separately.
         session["authorization"] = final_authorization
 
+        logger.info(
+            "[TOOL AUTHORIZATION] session_id=%s | level=%s | "
+            "model_authorization=%s | final_authorization=%s | "
+            "tool_calls_this_response=%s",
+            req.session_id,
+            level,
+            model_authorization,
+            final_authorization,
+            session["tool_calls_this_response"],
+        )
+
+    # Get history belonging only to the current level.
+    level_history = session["history_by_level"][level]
+
     try:
-        reply, session["history"], _ = await run_level_agent(
+        reply, updated_history, token_stats = await run_level_agent(
             level=level,
             message=req.message,
-            history=session["history"],
+            history=level_history,
             on_tool_called=on_tool_called,
             session_secrets=session["secrets"],
         )
+
+        # Save updated history only for this level.
+        session["history_by_level"][level] = updated_history
+
+        # Save actual token usage returned by llm.py.
+        session["last_token_stats"] = token_stats
+
     except ValueError:
+        logger.exception(
+            "[CHAT ERROR] Invalid level | session_id=%s | level=%s",
+            req.session_id,
+            level,
+        )
+
         raise HTTPException(
             status_code=400,
             detail="Invalid level",
         )
 
+    except Exception:
+        logger.exception(
+            "[CHAT ERROR] Agent execution failed | "
+            "session_id=%s | level=%s",
+            req.session_id,
+            level,
+        )
+
+        raise
+
     # Update cumulative eval counters after a successful response.
     tool_calls = session["tool_calls_this_response"]
+
     authorization_true_tool_calls = (
         session["authorization_true_tool_calls_this_response"]
     )
@@ -186,6 +252,21 @@ async def chat(req: ChatRequest):
 
     if tool_calls == 0:
         session["no_tool_call_responses_by_level"][level] += 1
+
+    logger.info(
+        "[CHAT COMPLETED] session_id=%s | level=%s | "
+        "tool_calls=%s | authorized_tool_calls=%s | "
+        "input_tokens=%s | output_tokens=%s | total_tokens=%s | "
+        "history_messages=%s",
+        req.session_id,
+        level,
+        tool_calls,
+        authorization_true_tool_calls,
+        token_stats.get("input_tokens", 0),
+        token_stats.get("output_tokens", 0),
+        token_stats.get("total_tokens", 0),
+        len(updated_history),
+    )
 
     return {
         "level": level,
@@ -213,7 +294,6 @@ def submit_secret(req: SecretRequest):
 
     level = session["current_level"]
 
-    # Levels 1 and 2 require an actual tool call and authorization=True.
     if level in (1, 2):
         if not session.get("tool_called", False):
             raise HTTPException(
@@ -227,11 +307,13 @@ def submit_secret(req: SecretRequest):
                 detail="The tool has not been authorized.",
             )
 
-    # Level 3 still requires at least 3 messages.
     if level == 3 and session["messages_sent"] < 3:
         raise HTTPException(
             status_code=400,
-            detail="You must send at least 3 messages to the robot before submitting the secret.",
+            detail=(
+                "You must send at least 3 messages to the robot "
+                "before submitting the secret."
+            ),
         )
 
     if session["attempts_left"] <= 0:
@@ -245,14 +327,15 @@ def submit_secret(req: SecretRequest):
             level,
             session["secrets"],
         )
+
         is_correct = normalize(req.secret) == normalize(correct_secret)
 
     else:
-        # Level 3 accepts either its generated tool secret or "No".
         generated_secret = extract_flag(
             3,
             session["secrets"],
         )
+
         fixed_secret = load_level_secret(3)
 
         is_correct = (
@@ -261,8 +344,19 @@ def submit_secret(req: SecretRequest):
         )
 
     if is_correct:
+        logger.info(
+            "[SECRET CORRECT] session_id=%s | level=%s",
+            req.session_id,
+            level,
+        )
+
         if level == 3:
             session["completed"] = True
+
+            logger.info(
+                "[GAME COMPLETED] session_id=%s",
+                req.session_id,
+            )
 
             return {
                 "success": True,
@@ -274,12 +368,20 @@ def submit_secret(req: SecretRequest):
         session["attempts_left"] = MAX_ATTEMPTS
         session["messages_left"] = MAX_MESSAGES
         session["tokens_left"] = MAX_TOKENS_LIMIT
-        session["history"] = []
+
+        # The next level already has its own empty history.
         session["tool_called"] = False
         session["authorization"] = False
         session["model_authorization"] = None
         session["model_authorization_true_seen"] = False
         session["messages_sent"] = 0
+        session["last_token_stats"] = {}
+
+        logger.info(
+            "[LEVEL UNLOCKED] session_id=%s | new_level=%s",
+            req.session_id,
+            session["current_level"],
+        )
 
         return {
             "success": True,
@@ -292,6 +394,14 @@ def submit_secret(req: SecretRequest):
         }
 
     session["attempts_left"] -= 1
+
+    logger.warning(
+        "[SECRET INCORRECT] session_id=%s | level=%s | "
+        "attempts_left=%s",
+        req.session_id,
+        level,
+        session["attempts_left"],
+    )
 
     return {
         "success": False,
@@ -306,4 +416,6 @@ def submit_secret(req: SecretRequest):
 
 @app.get("/health")
 def health():
+    logger.debug("[HEALTH CHECK]")
+
     return {"status": "ok"}
