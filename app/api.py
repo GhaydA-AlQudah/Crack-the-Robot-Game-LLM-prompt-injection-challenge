@@ -2,6 +2,7 @@ import re
 import uuid
 from pathlib import Path
 
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -11,7 +12,15 @@ from logger import logger
 
 
 app = FastAPI(title="Crack the Robot")
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://crack-the-robot-frontend.onrender.com",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 MAX_ATTEMPTS = 5
 MAX_MESSAGES = 15
 MAX_TOKENS_LIMIT = 1000
