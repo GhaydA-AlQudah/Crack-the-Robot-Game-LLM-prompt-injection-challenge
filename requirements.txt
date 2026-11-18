@@ -11,4 +11,4 @@ pytest-asyncio
 PyYAML
 pytest-cov
 pandas
-pydantic 2.14.1
+pydantic
