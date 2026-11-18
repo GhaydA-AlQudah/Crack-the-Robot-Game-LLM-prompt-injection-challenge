@@ -18,6 +18,16 @@
 <img width="1690" height="891" alt="image" src="https://github.com/user-attachments/assets/5bdcc3fb-3990-4ebc-bb64-0a7a1bf59660" />
 
 ---
+ARD - 
+tools calback
+levels
+secrets
+retrying
+agents initialization 
+secrets generating
+sessions
+fallback
+results file
 ## Problem Statement
 
 Large language models are increasingly deployed as assistants with access to
