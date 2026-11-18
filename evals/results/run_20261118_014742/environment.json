@@ -1,0 +1,14 @@
+{
+  "timestamp_utc": "2026-11-17T22:47:42.573285+00:00",
+  "python_version": "3.12.15",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "working_directory": "D:\\GhaydA\\Projects\\Prompt_Injection",
+  "primary_model": null,
+  "fallback_model": null,
+  "packages": {
+    "pydantic-ai": "2.57.0",
+    "fastapi": "0.146.0",
+    "httpx": "0.28.1",
+    "pydantic": "2.14.1"
+  }
+}

@@ -1,380 +1,787 @@
 
+"""Run every Crack The Robot scenario across all levels and save raw results."""
+
 from __future__ import annotations
 
 import asyncio
+import csv
+import importlib.metadata
+import inspect
 import json
-import time
+import os
+import platform
+import traceback
+from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import httpx
+from app.api import generate_session_secrets
+from app.llm import run_level_agent
 
-from app import api
-from evals.leak_judge import judge_leak
-from evals.scoring import score_trial
-from evals.metrics import aggregate_results, calculate_metrics
-from evals.report import print_report
-
-
-BASE_URL = "http://127.0.0.1:8000"
-
-EVALS_DIR = Path(__file__).resolve().parent
-SCENARIOS_FILE = EVALS_DIR / "scenarios.jsonl"
-RESULTS_DIR = EVALS_DIR / "results"
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+from evals.dataset import SCENARIOS
+from evals.instrumentation import (
+    inspect_messages,
+    redact_value,
+    safe_json_dump,
+    utc_now,
+)
 
 
-def load_scenarios() -> list[dict[str, Any]]:
-    """Load and validate evaluation scenarios from JSONL."""
-    scenarios: list[dict[str, Any]] = []
+RESULTS_ROOT = Path(__file__).resolve().parent / "results"
 
-    with SCENARIOS_FILE.open("r", encoding="utf-8") as file:
-        for line_number, line in enumerate(file, start=1):
-            if not line.strip():
-                continue
+LEVELS = (1, 2, 3)
 
-            try:
-                scenario = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(
-                    f"Invalid JSON in {SCENARIOS_FILE.name}, "
-                    f"line {line_number}: {exc}"
-                ) from exc
-
-            required_fields = {
-                "id",
-                "category",
-                "type",
-                "levels",
-                "messages",
-                "success_criteria",
-            }
-
-            missing_fields = required_fields - scenario.keys()
-            if missing_fields:
-                raise ValueError(
-                    f"Scenario on line {line_number} is missing fields: "
-                    f"{', '.join(sorted(missing_fields))}"
-                )
-
-            if scenario["type"] not in {"attack", "benign"}:
-                raise ValueError(
-                    f"Invalid scenario type on line {line_number}: "
-                    f"{scenario['type']}"
-                )
-
-            if not isinstance(scenario["levels"], list):
-                raise ValueError(
-                    f"'levels' must be a list on line {line_number}."
-                )
-
-            if not isinstance(scenario["messages"], list) or not scenario["messages"]:
-                raise ValueError(
-                    f"'messages' must be a non-empty list on line {line_number}."
-                )
-
-            if not all(isinstance(message, str) for message in scenario["messages"]):
-                raise ValueError(
-                    f"All messages must be strings on line {line_number}."
-                )
-
-            scenarios.append(scenario)
-
-    return scenarios
+DIALOGUE_COLUMNS = {
+    1: "L1_Player_Robot",
+    2: "L2_Player_Robot",
+    3: "L3_Player_Robot",
+}
 
 
-async def start_session(client: httpx.AsyncClient) -> dict[str, Any]:
-    """Start a new game session."""
-    response = await client.post(f"{BASE_URL}/game/start")
-    response.raise_for_status()
-    return response.json()
+# ---------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------
 
 
-async def send_chat_message(
-    client: httpx.AsyncClient,
-    session_id: str,
-    message: str,
-) -> tuple[int, dict[str, Any], float]:
-    """Send a message and return status, JSON response, and latency."""
-    start_time = time.perf_counter()
+def get_package_version(package_name: str) -> str | None:
+    try:
+        return importlib.metadata.version(package_name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
 
-    response = await client.post(
-        f"{BASE_URL}/game/chat",
-        json={
-            "session_id": session_id,
-            "message": message,
+
+def get_environment_info() -> dict[str, Any]:
+    return {
+        "timestamp_utc": utc_now(),
+        "python_version": platform.python_version(),
+        "platform": platform.platform(),
+        "working_directory": str(Path.cwd()),
+        "primary_model": os.getenv("PRIMARY_MODEL"),
+        "fallback_model": os.getenv("FALLBACK_MODEL"),
+        "packages": {
+            "pydantic-ai": get_package_version("pydantic-ai"),
+            "fastapi": get_package_version("fastapi"),
+            "httpx": get_package_version("httpx"),
+            "pydantic": get_package_version("pydantic"),
         },
+    }
+
+
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+
+
+def normalize_token_stats(stats: Any) -> dict[str, int]:
+    stats = stats or {}
+
+    if not isinstance(stats, dict):
+        try:
+            stats = vars(stats)
+        except TypeError:
+            stats = {}
+
+    return {
+        "input_tokens": int(stats.get("input_tokens", 0) or 0),
+        "output_tokens": int(stats.get("output_tokens", 0) or 0),
+        "total_tokens": int(stats.get("total_tokens", 0) or 0),
+        "requests": int(stats.get("requests", 0) or 0),
+    }
+
+
+def json_cell(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        default=str,
     )
 
-    latency_ms = (time.perf_counter() - start_time) * 1000
 
-    try:
-        payload = response.json()
-    except ValueError:
-        payload = {"raw_response": response.text}
+def get_new_history(
+    previous_history: Any,
+    updated_history: Any,
+) -> Any:
+    """Get only messages added during the current turn."""
+    if (
+        isinstance(previous_history, list)
+        and isinstance(updated_history, list)
+    ):
+        return updated_history[len(previous_history):]
 
-    return response.status_code, payload, latency_ms
+    return updated_history
 
 
-async def run_trial(
-    client: httpx.AsyncClient,
+def format_conversation(
+    conversation: list[dict[str, Any]],
+) -> str:
+    """Format all player and robot messages in one cell."""
+    lines = []
+
+    for message in conversation:
+        role = message["role"].capitalize()
+        content = message["content"]
+
+        lines.append(f"{role}: {content}")
+
+    return "\n\n".join(lines)
+
+
+def count_tools(
+    tool_calls: list[dict[str, Any]],
+) -> Counter:
+    return Counter(
+        item.get("tool_name", "")
+        for item in tool_calls
+    )
+
+
+def serialize_lookup_activity(
+    tool_calls: list[dict[str, Any]],
+    tool_returns: list[dict[str, Any]],
+    secrets: list[str],
+) -> dict[str, Any]:
+    """
+    Store lookup_employee calls and results.
+
+    Secret values are stored separately in dedicated columns.
+    """
+    lookup_calls = [
+        item
+        for item in tool_calls
+        if item.get("tool_name") == "lookup_employee"
+    ]
+
+    lookup_returns = [
+        item
+        for item in tool_returns
+        if item.get("tool_name") == "lookup_employee"
+    ]
+
+    return redact_value(
+        {
+            "calls": lookup_calls,
+            "results": lookup_returns,
+        },
+        secrets,
+    )
+
+
+# ---------------------------------------------------------------------
+# Agent
+# ---------------------------------------------------------------------
+
+
+async def call_agent(
+    level: int,
+    message: str,
+    history: Any,
+    callback: Any,
+    session_secrets: dict[int, str],
+) -> Any:
+    result = run_level_agent(
+        level=level,
+        message=message,
+        history=history,
+        on_tool_called=callback,
+        session_secrets=session_secrets,
+    )
+
+    if inspect.isawaitable(result):
+        result = await result
+
+    return result
+
+
+# ---------------------------------------------------------------------
+# Run one scenario on one level
+# ---------------------------------------------------------------------
+
+
+async def run_level_instance(
     scenario: dict[str, Any],
     level: int,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Run one scenario at one level."""
-    trial_start = time.perf_counter()
+    session_secrets: dict[int, str],
+    all_secrets: list[str],
+) -> dict[str, Any]:
 
-    trial: dict[str, Any] = {
-        "scenario_id": scenario["id"],
-        "category": scenario["category"],
-        "type": scenario["type"],
-        "level": level,
-        "success_criteria": scenario["success_criteria"],
-        "replies": [],
-        "error": None,
-        "http_status": None,
-        "model_authorization_true_seen": False,
-        "authorization": None,
-        "tool_calls": 0,
-        "authorization_true_tool_calls": 0,
-        "judge_evaluated_responses": 0,
-        "leaked_responses": 0,
-        "secret_leaked": None,
-    }
+    history: Any = []
 
-    response_records: list[dict[str, Any]] = []
-    session_id: str | None = None
+    conversation: list[dict[str, Any]] = []
 
-    try:
-        session = await start_session(client)
-        session_id = session.get("session_id")
+    all_tool_calls: list[dict[str, Any]] = []
+    all_tool_returns: list[dict[str, Any]] = []
 
-        if not session_id:
-            raise RuntimeError(
-                f"/game/start did not return session_id. Response: {session}"
-            )
+    authorization_events: list[dict[str, Any]] = []
 
-        # Use the requested level for this trial.
-        session["current_level"] = level
+    errors: list[dict[str, Any]] = []
 
-        # Set level in the server-side session if the API stores sessions there.
-        # This preserves the behavior from the existing evaluation runner.
-        if session_id in getattr(api, "SESSIONS", {}):
-            api.SESSIONS[session_id]["current_level"] = level
+    total_latency = 0.0
 
-        for turn_index, message in enumerate(scenario["messages"], start=1):
-            status_code, payload, latency_ms = await send_chat_message(
-                client=client,
-                session_id=session_id,
-                message=message,
-            )
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_tokens = 0
+    total_requests = 0
 
-            trial["http_status"] = status_code
-
-            reply_record: dict[str, Any] = {
-                "turn": turn_index,
-                "message": message,
-                "http_status": status_code,
-                "latency_ms": latency_ms,
-                "response": payload,
-            }
-            trial["replies"].append(reply_record)
-
-            if status_code != 200:
-                trial["error"] = (
-                    f"Chat request failed on turn {turn_index} "
-                    f"with HTTP {status_code}: {payload}"
-                )
-                break
-
-            final_output = (
-                payload.get("response")
-                or payload.get("reply")
-                or payload.get("message")
-                or payload.get("output")
-                or ""
-            )
-
-            if not isinstance(final_output, str):
-                final_output = str(final_output)
-
-            # Read the server-side session state, if available.
-            server_session = getattr(api, "SESSIONS", {}).get(session_id, {})
-
-            trial["model_authorization_true_seen"] = (
-                trial["model_authorization_true_seen"]
-                or server_session.get("model_authorization_true_seen") is True
-            )
-
-            trial["authorization"] = server_session.get("authorization")
-
-            trial["tool_calls"] += int(
-                server_session.get("tool_calls_this_response", 0) or 0
-            )
-            trial["authorization_true_tool_calls"] += int(
-                server_session.get(
-                    "authorization_true_tool_calls_this_response", 0
-                )
-                or 0
-            )
-
-            # Evaluate whether this response contains the expected secret.
-            try:
-                expected_secret = api.extract_flag(
-                    level,
-                    server_session.get("secrets", {}),
-                )
-
-                judgment = await judge_leak(
-                    session_id=session_id,
-                    level=level,
-                    final_output=final_output,
-                    expected_secret=expected_secret,
-                )
-
-                leaked = bool(judgment.leaked)
-                trial["judge_evaluated_responses"] += 1
-
-                if leaked:
-                    trial["leaked_responses"] += 1
-
-                response_records.append(
-                    {
-                        "scenario_id": scenario["id"],
-                        "category": scenario["category"],
-                        "type": scenario["type"],
-                        "level": level,
-                        "turn": turn_index,
-                        "http_status": status_code,
-                        "latency_ms": latency_ms,
-                        "tool_calls": server_session.get(
-                            "tool_calls_this_response", 0
-                        ),
-                        "authorization_true_tool_calls": server_session.get(
-                            "authorization_true_tool_calls_this_response", 0
-                        ),
-                        "leak_judged": True,
-                        "secret_leaked": leaked,
-                        "judge_reason": getattr(judgment, "reason", None),
-                    }
-                )
-
-            except Exception as exc:
-                response_records.append(
-                    {
-                        "scenario_id": scenario["id"],
-                        "category": scenario["category"],
-                        "type": scenario["type"],
-                        "level": level,
-                        "turn": turn_index,
-                        "http_status": status_code,
-                        "latency_ms": latency_ms,
-                        "tool_calls": server_session.get(
-                            "tool_calls_this_response", 0
-                        ),
-                        "authorization_true_tool_calls": server_session.get(
-                            "authorization_true_tool_calls_this_response", 0
-                        ),
-                        "leak_judged": False,
-                        "secret_leaked": None,
-                        "judge_error": str(exc),
-                    }
-                )
-
-    except Exception as exc:
-        trial["error"] = f"{type(exc).__name__}: {exc}"
-
-    finally:
-        elapsed_ms = (time.perf_counter() - trial_start) * 1000
-        trial["latency_ms"] = elapsed_ms
-
-        if session_id:
-            server_session = getattr(api, "SESSIONS", {}).get(session_id, {})
-
-            trial["model_authorization_true_seen"] = (
-                trial["model_authorization_true_seen"]
-                or server_session.get("model_authorization_true_seen") is True
-            )
-
-            trial["authorization"] = server_session.get("authorization")
-
-    # Determine the overall leak status.
-    if trial["leaked_responses"] > 0:
-        trial["secret_leaked"] = True
-    elif (
-        trial["judge_evaluated_responses"] > 0
-        and trial["judge_evaluated_responses"] == len(trial["replies"])
-        and all(reply.get("http_status") == 200 for reply in trial["replies"])
+    for turn_number, user_message in enumerate(
+        scenario["turns"],
+        start=1,
     ):
-        trial["secret_leaked"] = False
-    else:
-        trial["secret_leaked"] = None
 
-    # Score the trial using its declared success criterion.
-    score = score_trial(scenario, trial)
-    trial.update(score)
+        turn_authorization_events: list[dict[str, Any]] = []
 
-    return trial, response_records
+        def on_tool_called(
+            model_authorization: bool,
+            final_authorization: bool,
+        ) -> None:
+            event = {
+                "turn": turn_number,
+                "model_authorization": model_authorization,
+                "final_authorization": final_authorization,
+            }
 
+            turn_authorization_events.append(event)
+            authorization_events.append(event)
 
-async def run_evaluation() -> None:
-    scenarios = load_scenarios()
-    trials: list[dict[str, Any]] = []
-    all_response_records: list[dict[str, Any]] = []
+        conversation.append(
+            {
+                "turn": turn_number,
+                "role": "player",
+                "content": user_message,
+            }
+        )
 
-    timeout = httpx.Timeout(120.0)
+        previous_history = history
+        turn_started = datetime.now(timezone.utc)
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        for scenario in scenarios:
-            for level in scenario["levels"]:
-                print(
-                    f"Running scenario={scenario['id']} "
-                    f"type={scenario['type']} level={level}..."
-                )
+        try:
+            output, updated_history, token_stats = await call_agent(
+                level=level,
+                message=user_message,
+                history=history,
+                callback=on_tool_called,
+                session_secrets=session_secrets,
+            )
 
-                trial, response_records = await run_trial(
-                    client=client,
-                    scenario=scenario,
-                    level=level,
-                )
+            turn_finished = datetime.now(timezone.utc)
 
-                trials.append(trial)
-                all_response_records.extend(response_records)
+            total_latency += (
+                turn_finished - turn_started
+            ).total_seconds()
 
-                print(
-                    f"  outcome={trial.get('outcome')} "
-                    f"latency={trial.get('latency_ms', 0):.2f} ms "
-                    f"leaked={trial.get('secret_leaked')} "
-                    f"auth_true={trial.get('model_authorization_true_seen')} "
-                    f"error={trial.get('error')}"
-                )
+            new_messages = get_new_history(
+                previous_history,
+                updated_history,
+            )
 
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    results_file = RESULTS_DIR / f"evaluation_{timestamp}.json"
+            inspection = inspect_messages(new_messages)
 
-    metrics = calculate_metrics(trials)
-    security_metrics = aggregate_results(all_response_records)
+            tool_calls = inspection.get("tool_calls", [])
+            tool_returns = inspection.get("tool_returns", [])
 
-    results_payload = {
-        "timestamp": timestamp,
-        "total_trials": len(trials),
-        "trials": trials,
-        "response_records": all_response_records,
-        "metrics": metrics,
-        "security_metrics": security_metrics,
+            all_tool_calls.extend(tool_calls)
+            all_tool_returns.extend(tool_returns)
+
+            visible_output = str(output or "")
+
+            safe_visible_output = str(
+                redact_value(visible_output, all_secrets)
+            )
+
+            conversation.append(
+                {
+                    "turn": turn_number,
+                    "role": "robot",
+                    "content": safe_visible_output,
+                }
+            )
+
+            stats = normalize_token_stats(token_stats)
+
+            total_input_tokens += stats["input_tokens"]
+            total_output_tokens += stats["output_tokens"]
+            total_tokens += stats["total_tokens"]
+            total_requests += stats["requests"]
+
+            history = updated_history
+
+        except Exception as exc:
+            turn_finished = datetime.now(timezone.utc)
+
+            total_latency += (
+                turn_finished - turn_started
+            ).total_seconds()
+
+            errors.append(
+                {
+                    "turn": turn_number,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            )
+
+    # -----------------------------------------------------------------
+    # Aggregate information for this level execution
+    # -----------------------------------------------------------------
+
+    tool_counts = count_tools(all_tool_calls)
+
+    lookup_count = tool_counts.get("lookup_employee", 0)
+    secret_count = tool_counts.get("get_level_secret", 0)
+
+    model_authorization_values = [
+        event["model_authorization"]
+        for event in authorization_events
+    ]
+
+    final_authorization_values = [
+        event["final_authorization"]
+        for event in authorization_events
+    ]
+
+    lookup_activity = serialize_lookup_activity(
+        all_tool_calls,
+        all_tool_returns,
+        all_secrets,
+    )
+
+    return {
+        "level": level,
+
+        "dialogue": format_conversation(conversation),
+
+        "input_tokens": total_input_tokens,
+        "output_tokens": total_output_tokens,
+        "total_tokens": total_tokens,
+        "requests": total_requests,
+
+        "latency_seconds": round(total_latency, 4),
+
+        "lookup_employee_called": lookup_count > 0,
+        "lookup_employee_call_count": lookup_count,
+        "lookup_employee_activity": lookup_activity,
+
+        "get_level_secret_called": secret_count > 0,
+        "get_level_secret_call_count": secret_count,
+
+        "model_authorization_values": model_authorization_values,
+        "final_authorization_values": final_authorization_values,
+
+        "turn_count": len(scenario["turns"]),
+        "completed_turn_count": len(scenario["turns"]) - len(errors),
+
+        "errors": errors,
+        "status": "success" if not errors else (
+            "partial" if len(errors) < len(scenario["turns"])
+            else "failed"
+        ),
     }
 
-    with results_file.open("w", encoding="utf-8") as file:
-        json.dump(results_payload, file, indent=2, ensure_ascii=False)
 
-    print(f"\nResults saved to: {results_file}")
+# ---------------------------------------------------------------------
+# Run one scenario across ALL levels
+# ---------------------------------------------------------------------
 
-    print_report(
-        trials=trials,
-        metrics=metrics,
-        security_metrics=security_metrics,
+
+async def run_instance(
+    scenario: dict[str, Any],
+    run_id: str,
+    index: int,
+) -> dict[str, Any]:
+
+    # Generate one set of secrets shared across all three level runs.
+    session_secrets = generate_session_secrets()
+
+    all_secrets = [
+        session_secrets[level_number]
+        for level_number in LEVELS
+    ]
+
+    # Each scenario is executed independently on every level.
+    level_results: dict[int, dict[str, Any]] = {}
+
+    for level in LEVELS:
+        print(f"    Running on Level {level}...")
+
+        level_result = await run_level_instance(
+            scenario=scenario,
+            level=level,
+            session_secrets=session_secrets,
+            all_secrets=all_secrets,
+        )
+
+        level_results[level] = level_result
+
+        print(
+            f"      Status: {level_result['status']} | "
+            f"Tokens: {level_result['total_tokens']} | "
+            f"Latency: {level_result['latency_seconds']}s | "
+            f"Lookup calls: {level_result['lookup_employee_call_count']} | "
+            f"Secret calls: {level_result['get_level_secret_call_count']}"
+        )
+
+    # -----------------------------------------------------------------
+    # Prepare one dialogue column for each level
+    # -----------------------------------------------------------------
+
+    dialogue_columns = {
+        "L1_Player_Robot": level_results[1]["dialogue"],
+        "L2_Player_Robot": level_results[2]["dialogue"],
+        "L3_Player_Robot": level_results[3]["dialogue"],
+    }
+
+    # -----------------------------------------------------------------
+    # Overall scenario status
+    # -----------------------------------------------------------------
+
+    all_errors = []
+
+    for level in LEVELS:
+        for error in level_results[level]["errors"]:
+            all_errors.append(
+                {
+                    "level": level,
+                    **error,
+                }
+            )
+
+    successful_levels = sum(
+        level_results[level]["status"] == "success"
+        for level in LEVELS
     )
+
+    if successful_levels == len(LEVELS):
+        overall_status = "success"
+    elif successful_levels > 0 or any(
+        level_results[level]["status"] == "partial"
+        for level in LEVELS
+    ):
+        overall_status = "partial"
+    else:
+        overall_status = "failed"
+
+    # -----------------------------------------------------------------
+    # Build final scenario result
+    # -----------------------------------------------------------------
+
+    result = {
+        "run_id": run_id,
+        "index": index,
+        "instance_id": scenario["id"],
+
+        # Original dataset metadata.
+        "level": scenario["level"],
+        "category": scenario["category"],
+        "attack_type": scenario["attack_type"],
+        "difficulty": scenario["difficulty"],
+        "description": scenario.get("description", ""),
+        "is_attack": scenario["is_attack"],
+        "expected_success": scenario["expected_success"],
+        "filter_bypass_test": scenario.get("filter_bypass_test"),
+
+        # Store all three generated secrets separately.
+        "L1_Secret": session_secrets[1],
+        "L2_Secret": session_secrets[2],
+        "L3_Secret": session_secrets[3],
+
+        **dialogue_columns,
+
+        # Execution results for each level.
+        "level_results": level_results,
+
+        # Total turns across all three executions.
+        "turn_count": sum(
+            level_results[level]["turn_count"]
+            for level in LEVELS
+        ),
+
+        "completed_turn_count": sum(
+            level_results[level]["completed_turn_count"]
+            for level in LEVELS
+        ),
+
+        "status": overall_status,
+        "successful_levels": successful_levels,
+        "errors": all_errors,
+        "timestamp_utc": utc_now(),
+    }
+
+    return result
+
+
+# ---------------------------------------------------------------------
+# CSV columns
+# ---------------------------------------------------------------------
+
+
+CSV_COLUMNS = [
+    "Index",
+    "Scenario_ID",
+    "Level",
+    "Category",
+    "Attack_Type",
+    "Difficulty",
+    "Description",
+    "Is_Attack",
+    "Expected_Success",
+    "L1_Secret",
+    "L2_Secret",
+    "L3_Secret",
+    "Filter_Bypass_Test",
+    "L1_Player_Robot",
+    "L2_Player_Robot",
+    "L3_Player_Robot",
+]
+
+# Each level gets its own execution columns.
+for level in LEVELS:
+    prefix = f"L{level}"
+
+    CSV_COLUMNS.extend(
+        [
+            f"{prefix}_Input_Tokens",
+            f"{prefix}_Output_Tokens",
+            f"{prefix}_Total_Tokens",
+            f"{prefix}_Requests",
+            f"{prefix}_Latency_Seconds",
+            f"{prefix}_Lookup_Employee_Called",
+            f"{prefix}_Lookup_Employee_Call_Count",
+            f"{prefix}_Lookup_Employee_Activity",
+            f"{prefix}_Get_Level_Secret_Called",
+            f"{prefix}_Get_Level_Secret_Call_Count",
+            f"{prefix}_Model_Authorization",
+            f"{prefix}_Final_Authorization",
+            f"{prefix}_Status",
+        ]
+    )
+
+CSV_COLUMNS.extend(
+    [
+        "Turn_Count",
+        "Completed_Turn_Count",
+        "Successful_Levels",
+        "Status",
+        "Errors",
+        "Timestamp_UTC",
+    ]
+)
+
+
+# ---------------------------------------------------------------------
+# Convert one scenario into one table row
+# ---------------------------------------------------------------------
+
+
+def make_csv_row(
+    result: dict[str, Any],
+) -> dict[str, Any]:
+
+    row: dict[str, Any] = {
+        "Index": result["index"],
+        "Scenario_ID": result["instance_id"],
+        "Level": result["level"],
+        "Category": result["category"],
+        "Attack_Type": result["attack_type"],
+        "Difficulty": result["difficulty"],
+        "Description": result["description"],
+        "Is_Attack": result["is_attack"],
+        "Expected_Success": result["expected_success"],
+        "L1_Secret": result["L1_Secret"],
+        "L2_Secret": result["L2_Secret"],
+        "L3_Secret": result["L3_Secret"],
+        "Filter_Bypass_Test": result["filter_bypass_test"],
+        "L1_Player_Robot": result["L1_Player_Robot"],
+        "L2_Player_Robot": result["L2_Player_Robot"],
+        "L3_Player_Robot": result["L3_Player_Robot"],
+        "Turn_Count": result["turn_count"],
+        "Completed_Turn_Count": result["completed_turn_count"],
+        "Successful_Levels": result["successful_levels"],
+        "Status": result["status"],
+        "Errors": json_cell(result["errors"]),
+        "Timestamp_UTC": result["timestamp_utc"],
+    }
+
+    # Fill execution columns for all three levels.
+    for level in LEVELS:
+        prefix = f"L{level}"
+        level_result = result["level_results"][level]
+
+        row.update(
+            {
+                f"{prefix}_Input_Tokens": level_result["input_tokens"],
+                f"{prefix}_Output_Tokens": level_result["output_tokens"],
+                f"{prefix}_Total_Tokens": level_result["total_tokens"],
+                f"{prefix}_Requests": level_result["requests"],
+                f"{prefix}_Latency_Seconds": level_result["latency_seconds"],
+                f"{prefix}_Lookup_Employee_Called": (
+                    level_result["lookup_employee_called"]
+                ),
+                f"{prefix}_Lookup_Employee_Call_Count": (
+                    level_result["lookup_employee_call_count"]
+                ),
+                f"{prefix}_Lookup_Employee_Activity": json_cell(
+                    level_result["lookup_employee_activity"]
+                ),
+                f"{prefix}_Get_Level_Secret_Called": (
+                    level_result["get_level_secret_called"]
+                ),
+                f"{prefix}_Get_Level_Secret_Call_Count": (
+                    level_result["get_level_secret_call_count"]
+                ),
+                f"{prefix}_Model_Authorization": json_cell(
+                    level_result["model_authorization_values"]
+                ),
+                f"{prefix}_Final_Authorization": json_cell(
+                    level_result["final_authorization_values"]
+                ),
+                f"{prefix}_Status": level_result["status"],
+            }
+        )
+
+    return row
+
+
+def generate_results_csv(
+    results: list[dict[str, Any]],
+    output_path: Path,
+) -> None:
+
+    with output_path.open(
+        "w",
+        newline="",
+        encoding="utf-8-sig",
+    ) as csv_file:
+
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=CSV_COLUMNS,
+            extrasaction="ignore",
+        )
+
+        writer.writeheader()
+
+        for result in results:
+            writer.writerow(make_csv_row(result))
+
+
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
+
+
+async def main() -> None:
+
+    RESULTS_ROOT.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    run_id = datetime.now().strftime(
+        "run_%Y%m%d_%H%M%S"
+    )
+
+    run_directory = RESULTS_ROOT / run_id
+    run_directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    safe_json_dump(
+        str(run_directory / "environment.json"),
+        get_environment_info(),
+    )
+
+    all_results: list[dict[str, Any]] = []
+
+    total_executions = len(SCENARIOS) * len(LEVELS)
+
+    print(f"\nStarting evaluation: {run_id}")
+    print(f"Scenarios: {len(SCENARIOS)}")
+    print(f"Levels per scenario: {len(LEVELS)}")
+    print(f"Total executions: {total_executions}")
+    print("Execution mode: sequential")
+    print("Results: one CSV row per scenario\n")
+
+    for index, scenario in enumerate(
+        SCENARIOS,
+        start=1,
+    ):
+
+        print(
+            f"[{index}/{len(SCENARIOS)}] "
+            f"{scenario['id']} "
+            f"(Dataset Level: {scenario['level']})"
+        )
+
+        result = await run_instance(
+            scenario=scenario,
+            run_id=run_id,
+            index=index,
+        )
+
+        all_results.append(result)
+
+        print(
+            f"  Overall status: {result['status']} | "
+            f"Successful levels: {result['successful_levels']}/{len(LEVELS)}"
+        )
+
+    # Main results table.
+    results_path = run_directory / "results.csv"
+
+    generate_results_csv(
+        all_results,
+        results_path,
+    )
+
+    # Summary contains run-level counts only.
+    summary = {
+        "run_id": run_id,
+        "completed_at_utc": utc_now(),
+        "total_scenarios": len(all_results),
+        "levels_per_scenario": len(LEVELS),
+        "total_executions": total_executions,
+        "successful_scenarios": sum(
+            item["status"] == "success"
+            for item in all_results
+        ),
+        "partial_scenarios": sum(
+            item["status"] == "partial"
+            for item in all_results
+        ),
+        "failed_scenarios": sum(
+            item["status"] == "failed"
+            for item in all_results
+        ),
+        "results_file": "results.csv",
+    }
+
+    safe_json_dump(
+        str(run_directory / "summary.json"),
+        summary,
+    )
+
+    # Save errors separately.
+    error_results = [
+        {
+            "index": item["index"],
+            "instance_id": item["instance_id"],
+            "errors": item["errors"],
+        }
+        for item in all_results
+        if item["errors"]
+    ]
+
+    safe_json_dump(
+        str(run_directory / "errors.json"),
+        error_results,
+    )
+
+    print("\nRecording completed.")
+    print(f"Total executions: {total_executions}")
+    print(f"Results saved to: {results_path}")
 
 
 if __name__ == "__main__":
-    asyncio.run(run_evaluation())
+    asyncio.run(main())

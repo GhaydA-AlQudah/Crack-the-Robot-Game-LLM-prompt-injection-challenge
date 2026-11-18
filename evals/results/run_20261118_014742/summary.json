@@ -1,0 +1,11 @@
+{
+  "run_id": "run_20261118_014742",
+  "completed_at_utc": "2026-11-17T23:15:42.578326+00:00",
+  "total_scenarios": 90,
+  "levels_per_scenario": 3,
+  "total_executions": 270,
+  "successful_scenarios": 90,
+  "partial_scenarios": 0,
+  "failed_scenarios": 0,
+  "results_file": "results.csv"
+}
