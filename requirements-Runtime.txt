@@ -1,14 +1,10 @@
-ruff
-pytest
-mypy
+# Runtime Dependencies
 fastapi 
 uvicorn 
 python-dotenv 
 pydantic-ai
 pydantic-ai-slim[groq]
 httpx
-pytest-asyncio
 PyYAML
-pytest-cov
 pandas
 pydantic
