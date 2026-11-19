@@ -17,9 +17,11 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - run: pip install -r requirements.txt
+      - name: Install backend dependencies
+        run: pip install -r requirements-Runtime.txt -r requirements-Development.txt
 
-      - run: python -m pytest -q tests
+      - name: Run backend tests
+        run: python -m pytest -q tests
         env:
           LLM_API_KEY: dummy-key-for-tests
 
