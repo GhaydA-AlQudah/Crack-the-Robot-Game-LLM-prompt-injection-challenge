@@ -55,6 +55,9 @@ class SecretRequest(BaseModel):
     session_id: str
     secret: str
 
+@app.get("/")
+async def root():
+    return {"message": "Crack The Robot API is running"}
 
 @app.post("/game/start")
 def start_game():
