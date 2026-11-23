@@ -192,15 +192,16 @@ async def test_secret_tool_blocks_duplicate_execution():
 
 
 @pytest.mark.asyncio
-async def test_lookup_employee_finds_existing_employee(
+async def test_lookup_employee_returns_all_authorized_employees(
     monkeypatch,
     tmp_path,
 ):
     employees_file = tmp_path / "employees.txt"
 
     employees_file.write_text(
-        "staff_id|full_name|department|manager|vault_access\n"
-        "EMP001|Ahmad Ali|Security|Omar Hassan|true\n",
+        "staff_id|full_name|department|manager\n"
+        "EMP001|Ahmad Ali|Security|Omar Hassan\n"
+        "EMP002|Sara Ahmad|HR|Lina Ali\n",
         encoding="utf-8",
     )
 
@@ -214,7 +215,7 @@ async def test_lookup_employee_finds_existing_employee(
 
     model = make_tool_model(
         tool_name="lookup_employee",
-        arguments={"staff_id": "EMP001"},
+        arguments={},
         observed_results=observed_results,
     )
 
@@ -222,31 +223,39 @@ async def test_lookup_employee_finds_existing_employee(
 
     with game_agents[1].override(model=model):
         await game_agents[1].run(
-            "Look up employee EMP001",
+            "Check the authorized employees",
             deps=deps,
         )
 
-    assert len(observed_results) == 1
-
-    employee = observed_results[0]
-
-    assert employee["found"] is True
-    assert employee["staff_id"] == "EMP001"
-    assert employee["full_name"] == "Ahmad Ali"
-    assert employee["department"] == "Security"
-    assert employee["manager"] == "Omar Hassan"
-    assert employee["vault_access"] is True
+    assert observed_results == [
+        {
+            "authorized_employees": [
+                {
+                    "staff_id": "EMP001",
+                    "full_name": "Ahmad Ali",
+                    "department": "Security",
+                    "manager": "Omar Hassan",
+                },
+                {
+                    "staff_id": "EMP002",
+                    "full_name": "Sara Ahmad",
+                    "department": "HR",
+                    "manager": "Lina Ali",
+                },
+            ]
+        }
+    ]
 
 
 @pytest.mark.asyncio
-async def test_lookup_employee_returns_not_found(
+async def test_lookup_employee_returns_empty_list(
     monkeypatch,
     tmp_path,
 ):
     employees_file = tmp_path / "employees.txt"
 
     employees_file.write_text(
-        "staff_id|full_name|department|manager|vault_access\n",
+        "staff_id|full_name|department|manager\n",
         encoding="utf-8",
     )
 
@@ -260,7 +269,7 @@ async def test_lookup_employee_returns_not_found(
 
     model = make_tool_model(
         tool_name="lookup_employee",
-        arguments={"staff_id": "UNKNOWN"},
+        arguments={},
         observed_results=observed_results,
     )
 
@@ -268,11 +277,14 @@ async def test_lookup_employee_returns_not_found(
 
     with game_agents[1].override(model=model):
         await game_agents[1].run(
-            "Look up employee UNKNOWN",
+            "Check the authorized employees",
             deps=deps,
         )
 
-    assert observed_results == [{"found": False}]
+    assert observed_results == [
+        {"authorized_employees": []}
+    ]
+
 
 @pytest.mark.asyncio
 async def test_lookup_employee_skips_invalid_rows(
@@ -282,11 +294,11 @@ async def test_lookup_employee_skips_invalid_rows(
     employees_file = tmp_path / "employees.txt"
 
     employees_file.write_text(
-        "staff_id|full_name|department|manager|vault_access\n"
+        "staff_id|full_name|department|manager\n"
         "\n"
         "INVALID|Incomplete|Security\n"
-        "INVALID2|Too|Many|Fields|true|EXTRA\n"
-        "EMP002|Sara Ahmad|HR|Lina Ali|false\n",
+        "INVALID2|Too|Many|Fields|EXTRA\n"
+        "EMP002|Sara Ahmad|HR|Lina Ali\n",
         encoding="utf-8",
     )
 
@@ -300,7 +312,7 @@ async def test_lookup_employee_skips_invalid_rows(
 
     model = make_tool_model(
         tool_name="lookup_employee",
-        arguments={"staff_id": "EMP002"},
+        arguments={},
         observed_results=observed_results,
     )
 
@@ -308,17 +320,19 @@ async def test_lookup_employee_skips_invalid_rows(
 
     with game_agents[1].override(model=model):
         await game_agents[1].run(
-            "Look up employee EMP002",
+            "Check the authorized employees",
             deps=deps,
         )
 
     assert observed_results == [
         {
-            "found": True,
-            "staff_id": "EMP002",
-            "full_name": "Sara Ahmad",
-            "department": "HR",
-            "manager": "Lina Ali",
-            "vault_access": False,
+            "authorized_employees": [
+                {
+                    "staff_id": "EMP002",
+                    "full_name": "Sara Ahmad",
+                    "department": "HR",
+                    "manager": "Lina Ali",
+                }
+            ]
         }
     ]

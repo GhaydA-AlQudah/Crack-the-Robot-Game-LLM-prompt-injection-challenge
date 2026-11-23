@@ -222,7 +222,7 @@ def get_agent(level: int) -> Agent:
         return tool_result
 
 
-    @agent.tool(description=LOOKUP_EMPLOYEE_DESCRIPTION)
+    @agent.tool_plain(description=LOOKUP_EMPLOYEE_DESCRIPTION)
     def lookup_employee() -> dict:
         """Return all employees authorized to access the vault."""
 
